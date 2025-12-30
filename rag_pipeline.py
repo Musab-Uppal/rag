@@ -8,7 +8,7 @@ import docx
 import warnings
 from sklearn.metrics.pairwise import cosine_similarity
 import pickle
-import hashlib
+import json
 warnings.filterwarnings('ignore')
 
 class SimpleRAGPipeline:
@@ -29,9 +29,12 @@ class SimpleRAGPipeline:
         self.api_key = os.getenv("GROQ_API_KEY")
         if not self.api_key:
             raise ValueError("GROQ_API_KEY not found in environment variables")
+        
+        # API endpoint
+        self.api_url = "https://api.groq.com/openai/v1/chat/completions"
     
     def _simple_embedding(self, text: str) -> np.ndarray:
-        """Simple TF-IDF like embedding (fallback when no sentence-transformers)"""
+        """Simple TF-IDF like embedding"""
         words = text.lower().split()
         word_freq = {}
         for word in words:
@@ -179,15 +182,14 @@ class SimpleRAGPipeline:
         # Create query embedding
         query_embedding = self._simple_embedding(query)
         
+        # Convert embeddings to numpy array for efficient computation
+        embeddings_array = np.array(self.embeddings)
+        
         # Calculate similarities
-        similarities = []
-        for doc_embedding in self.embeddings:
-            # Convert to 2D arrays for cosine_similarity
-            sim = cosine_similarity(
-                query_embedding.reshape(1, -1),
-                doc_embedding.reshape(1, -1)
-            )[0][0]
-            similarities.append(sim)
+        similarities = cosine_similarity(
+            query_embedding.reshape(1, -1),
+            embeddings_array
+        )[0]
         
         # Get top k indices
         indices = np.argsort(similarities)[-k:][::-1]
@@ -197,11 +199,69 @@ class SimpleRAGPipeline:
         for idx in indices:
             results.append({
                 'content': self.documents[idx],
-                'similarity': similarities[idx],
+                'similarity': float(similarities[idx]),
                 'metadata': self.metadata[idx]
             })
         
         return results
+    
+    def _call_groq_api(self, prompt: str) -> str:
+        """Make API call to Groq"""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that answers questions based on provided document excerpts. If you cannot find the answer in the provided context, say so."
+                },
+                {
+                    "role": "user", 
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.1,
+            "max_tokens": 500,
+            "top_p": 0.9,
+            "stream": False
+        }
+        
+        try:
+            response = requests.post(
+                self.api_url,
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            
+            print(f"API Response Status: {response.status_code}")
+            
+            if response.status_code == 200:
+                result = response.json()
+                if 'choices' in result and len(result['choices']) > 0:
+                    return result['choices'][0]['message']['content']
+                else:
+                    return f"Unexpected API response: {json.dumps(result, indent=2)}"
+            else:
+                error_detail = ""
+                try:
+                    error_json = response.json()
+                    error_detail = f" | Error: {error_json.get('error', {}).get('message', 'Unknown error')}"
+                except:
+                    error_detail = f" | Response: {response.text[:200]}"
+                
+                return f"API Error (Status: {response.status_code}{error_detail})"
+                
+        except requests.exceptions.Timeout:
+            return "API request timed out. Please try again."
+        except requests.exceptions.ConnectionError:
+            return "Connection error. Please check your internet connection."
+        except Exception as e:
+            return f"Error calling API: {str(e)}"
     
     def query_documents(self, query: str, k: int = 4) -> Dict:
         """
@@ -212,54 +272,35 @@ class SimpleRAGPipeline:
         
         if not similar_docs:
             return {
-                "answer": "No relevant documents found.",
+                "answer": "No relevant documents found. Please upload documents first or try a different query.",
                 "sources": []
             }
         
         # Combine context from similar documents
         context_parts = []
         for i, doc in enumerate(similar_docs[:k]):
-            context_parts.append(f"[Document {i+1}]: {doc['content']}")
+            context_parts.append(f"--- Excerpt {i+1} ---\n{doc['content']}")
         
         context = "\n\n".join(context_parts)
         
-        # Call Groq API
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        prompt = f"""Based on the following document excerpts, answer the question. 
-If the answer cannot be found in the documents, say "I cannot find this information in the provided documents."
+        # Create prompt
+        prompt = f"""Please answer the following question based ONLY on the provided document excerpts.
 
-DOCUMENTS:
+DOCUMENT EXCERPTS:
 {context}
 
 QUESTION: {query}
 
+INSTRUCTIONS:
+1. Answer based only on the provided excerpts
+2. If the information is not in the excerpts, say "I cannot find this information in the provided documents"
+3. Be concise and factual
+4. Reference specific excerpts when possible
+
 ANSWER:"""
         
-        payload = {
-            "model": "mixtral-8x7b-32768",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1,
-            "max_tokens": 1000
-        }
-        
-        try:
-            response = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                answer = response.json()['choices'][0]['message']['content']
-            else:
-                answer = f"Error from Groq API (Status: {response.status_code})"
-        except Exception as e:
-            answer = f"Error calling Groq API: {str(e)}"
+        # Call API
+        answer = self._call_groq_api(prompt)
         
         # Prepare sources
         sources = []
