@@ -9,6 +9,7 @@ import warnings
 from sklearn.metrics.pairwise import cosine_similarity
 import pickle
 import json
+import shutil
 warnings.filterwarnings('ignore')
 
 class SimpleRAGPipeline:
@@ -35,16 +36,23 @@ class SimpleRAGPipeline:
     
     def _simple_embedding(self, text: str) -> np.ndarray:
         """Simple TF-IDF like embedding"""
-        words = text.lower().split()
+        # Clean text
+        text = text.lower()
+        words = text.split()
+        
+        # Remove very short words
+        words = [w for w in words if len(w) > 2]
+        
+        # Count word frequencies
         word_freq = {}
         for word in words:
             word_freq[word] = word_freq.get(word, 0) + 1
         
-        # Simple hash-based embedding (32 dimensions)
-        embedding = np.zeros(32)
+        # Simple hash-based embedding (64 dimensions for better quality)
+        embedding = np.zeros(64)
         for word, freq in word_freq.items():
             # Use hash to get consistent position
-            pos = abs(hash(word)) % 32
+            pos = abs(hash(word)) % 64
             embedding[pos] += freq
         
         # Normalize
@@ -63,18 +71,47 @@ class SimpleRAGPipeline:
                     self.documents = data.get('documents', [])
                     self.embeddings = data.get('embeddings', [])
                     self.metadata = data.get('metadata', [])
-        except:
-            pass
+                    print(f"Loaded {len(self.documents)} chunks from disk")
+        except Exception as e:
+            print(f"Error loading from disk: {e}")
+            self.documents = []
+            self.embeddings = []
+            self.metadata = []
     
     def _save_to_disk(self):
         """Save embeddings to disk"""
-        os.makedirs(os.path.dirname(self.vector_db_path), exist_ok=True)
-        with open(f"{self.vector_db_path}.pkl", 'wb') as f:
-            pickle.dump({
-                'documents': self.documents,
-                'embeddings': self.embeddings,
-                'metadata': self.metadata
-            }, f)
+        try:
+            os.makedirs(os.path.dirname(self.vector_db_path), exist_ok=True)
+            with open(f"{self.vector_db_path}.pkl", 'wb') as f:
+                pickle.dump({
+                    'documents': self.documents,
+                    'embeddings': self.embeddings,
+                    'metadata': self.metadata
+                }, f)
+            print(f"Saved {len(self.documents)} chunks to disk")
+        except Exception as e:
+            print(f"Error saving to disk: {e}")
+    
+    def clear_documents(self):
+        """Clear all documents from memory and disk"""
+        self.documents = []
+        self.embeddings = []
+        self.metadata = []
+        
+        # Delete pickle file if exists
+        try:
+            if os.path.exists(f"{self.vector_db_path}.pkl"):
+                os.remove(f"{self.vector_db_path}.pkl")
+                print("Cleared saved documents from disk")
+        except:
+            pass
+        
+        # Also delete the directory if empty
+        try:
+            if os.path.exists(self.vector_db_path):
+                shutil.rmtree(self.vector_db_path)
+        except:
+            pass
     
     def load_document(self, file_path: str) -> List[Dict]:
         """
@@ -144,12 +181,32 @@ class SimpleRAGPipeline:
     def split_text(self, text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
         """Split text into overlapping chunks"""
         chunks = []
-        words = text.split()
+        sentences = text.split('. ')
         
-        for i in range(0, len(words), chunk_size - overlap):
-            chunk = ' '.join(words[i:i + chunk_size])
-            if chunk.strip():
-                chunks.append(chunk)
+        current_chunk = []
+        current_length = 0
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+                
+            sentence_length = len(sentence.split())
+            
+            if current_length + sentence_length > chunk_size and current_chunk:
+                # Save current chunk
+                chunks.append('. '.join(current_chunk) + '.')
+                # Start new chunk with overlap
+                overlap_words = min(len(current_chunk), overlap // 20)  # Keep last few sentences
+                current_chunk = current_chunk[-overlap_words:] if overlap_words > 0 else []
+                current_length = sum(len(s.split()) for s in current_chunk)
+            
+            current_chunk.append(sentence)
+            current_length += sentence_length
+        
+        # Add the last chunk
+        if current_chunk:
+            chunks.append('. '.join(current_chunk) + '.')
         
         return chunks
     
@@ -157,6 +214,9 @@ class SimpleRAGPipeline:
         """
         Create vector store from documents
         """
+        # Clear existing data first
+        self.clear_documents()
+        
         for doc in documents:
             chunks = self.split_text(doc['text'])
             
@@ -182,6 +242,9 @@ class SimpleRAGPipeline:
         # Create query embedding
         query_embedding = self._simple_embedding(query)
         
+        if len(self.embeddings) == 0:
+            return []
+        
         # Convert embeddings to numpy array for efficient computation
         embeddings_array = np.array(self.embeddings)
         
@@ -192,6 +255,7 @@ class SimpleRAGPipeline:
         )[0]
         
         # Get top k indices
+        k = min(k, len(similarities))
         indices = np.argsort(similarities)[-k:][::-1]
         
         # Return results

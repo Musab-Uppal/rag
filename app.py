@@ -7,7 +7,20 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-
+# Check for API key
+if not os.getenv("GROQ_API_KEY"):
+    st.error("⚠️ GROQ_API_KEY not found. Please add it to your Streamlit secrets.")
+    st.info("""
+    To run locally:
+    1. Create a `.env` file with:
+       GROQ_API_KEY=your_api_key_here
+    2. Get a free API key from [console.groq.com](https://console.groq.com)
+    
+    To deploy on Streamlit Cloud:
+    1. Go to app settings → Secrets
+    2. Add: GROQ_API_KEY="your_api_key_here"
+    """)
+    st.stop()
 
 # Initialize session state
 if 'rag_pipeline' not in st.session_state:
@@ -15,6 +28,7 @@ if 'rag_pipeline' not in st.session_state:
         st.session_state.rag_pipeline = SimpleRAGPipeline()
         st.session_state.documents_loaded = False
         st.session_state.chunk_count = 3
+        st.session_state.processed_files = []
     except Exception as e:
         st.error(f"Failed to initialize RAG pipeline: {str(e)}")
         st.stop()
@@ -68,15 +82,23 @@ with st.sidebar:
             
             if all_documents:
                 try:
-                    # Create vector store
+                    # Create vector store (this will clear old docs first)
                     st.session_state.rag_pipeline.create_vector_store(all_documents)
                     st.session_state.documents_loaded = True
+                    st.session_state.processed_files = [f.name for f in uploaded_files]
                     st.success(f"✅ Processed {len(all_documents)} document(s) successfully!")
                     st.balloons()
                 except Exception as e:
                     st.error(f"Error: {str(e)}")
     
     st.divider()
+    
+    # Show current status
+    if st.session_state.documents_loaded:
+        st.header("📊 Current Status")
+        st.success(f"✅ {len(st.session_state.processed_files)} file(s) loaded")
+        for file in st.session_state.processed_files:
+            st.caption(f"• {file}")
     
     # Settings
     st.header("⚙️ Settings")
@@ -88,9 +110,11 @@ with st.sidebar:
         help="More chunks = more context but potentially more noise"
     )
     
-    if st.button("🗑️ Clear All Documents"):
+    if st.button("🗑️ Clear All Documents", type="secondary"):
+        # Clear the pipeline
+        st.session_state.rag_pipeline.clear_documents()
         st.session_state.documents_loaded = False
-        st.session_state.rag_pipeline = SimpleRAGPipeline()
+        st.session_state.processed_files = []
         st.success("Documents cleared!")
         st.rerun()
 
@@ -117,7 +141,12 @@ if not st.session_state.documents_loaded:
         - "Find information about [topic]"
         """)
 else:
-    st.success(f"✅ Documents are loaded and ready!")
+    st.success(f"✅ {len(st.session_state.processed_files)} document(s) loaded and ready!")
+    
+    # Show loaded files
+    with st.expander("📋 View loaded documents"):
+        for file in st.session_state.processed_files:
+            st.write(f"• {file}")
     
     # Chat interface
     st.divider()
@@ -126,11 +155,19 @@ else:
     # Pre-defined questions
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("📋 What is this document about?"):
+        if st.button("📋 What is this document about?", use_container_width=True):
             st.session_state.last_question = "What is this document about? Provide a brief overview."
     with col2:
-        if st.button("🎯 Summarize key points"):
+        if st.button("🎯 Summarize key points", use_container_width=True):
             st.session_state.last_question = "Summarize the key points or main takeaways from these documents."
+    
+    col3, col4 = st.columns(2)
+    with col3:
+        if st.button("🔍 Find main topics", use_container_width=True):
+            st.session_state.last_question = "What are the main topics discussed in these documents?"
+    with col4:
+        if st.button("📝 Extract key findings", use_container_width=True):
+            st.session_state.last_question = "What are the key findings or conclusions in these documents?"
     
     # Chat input
     query = st.chat_input("Type your question here...")
@@ -171,3 +208,22 @@ else:
                     st.error(f"Error: {str(e)}")
                     st.info("Try processing the documents again or use simpler questions.")
 
+# Footer
+st.divider()
+st.caption("Made with Streamlit | Uses Groq API for LLM responses")
+
+# Add API testing
+with st.sidebar:
+    st.divider()
+    if st.button("🧪 Test API Connection"):
+        try:
+            # Simple test
+            import requests
+            headers = {"Authorization": f"Bearer {os.getenv('GROQ_API_KEY')}"}
+            response = requests.get("https://api.groq.com/openai/v1/models", headers=headers)
+            if response.status_code == 200:
+                st.success("✅ API connection successful!")
+            else:
+                st.error(f"❌ API Error: {response.status_code}")
+        except Exception as e:
+            st.error(f"❌ Connection failed: {str(e)}")
